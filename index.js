@@ -39,7 +39,7 @@ app.post("/webhook", async (req, res) => {
           try {
             // Send to Gemini Model
             const vertexRes = await axios.post(
-              VERTEX_ENDPOINT,
+              `${VERTEX_ENDPOINT}?key=${VERTEX_API_KEY}`,
               {
                 instances: [
                   {
