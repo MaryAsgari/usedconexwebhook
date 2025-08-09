@@ -3,6 +3,9 @@ const bodyParser = require("body-parser");
 const axios = require("axios");
 const crypto = require("crypto");
 require("dotenv").config();
+const { VertexAI } = require('@google-cloud/vertexai');
+
+
 
 // ===== Vertex AI (Gemini) =====
 const { VertexAI } = require("@google-cloud/vertexai");
