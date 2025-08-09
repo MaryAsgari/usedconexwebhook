@@ -1,14 +1,10 @@
 const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
-const crypto = require("crypto");
-require("dotenv").config();
 const { VertexAI } = require('@google-cloud/vertexai');
+require("dotenv").config();
 
-
-
-// ===== Vertex AI (Gemini) =====
-const { VertexAI } = require("@google-cloud/vertexai");
+// Configuration
 const {
   VERIFY_TOKEN,
   PAGE_ACCESS_TOKEN,
@@ -16,41 +12,61 @@ const {
   VERTEX_LOCATION = "us-central1",
   USEDCONEX_API = "https://api.usedconex.com",
   ZIP_URL = "/client/v1/Order/zip",
-  QUOTE_URL = "/client/v1/Quote/create", // اگر مسیر واقعی شما فرق دارد این را تغییر بده
+  QUOTE_URL = "/client/v1/Quote/create",
 } = process.env;
 
+// Initialize Vertex AI
 const vertexAI = new VertexAI({
   project: GCLOUD_PROJECT,
   location: VERTEX_LOCATION,
 });
 const model = vertexAI.getGenerativeModel({ model: "gemini-1.5-pro" });
 
-// ===== Tools (function calling) =====
+// Tools for function calling
 const tools = [
   {
     functionDeclarations: [
       {
         name: "get_zip_info",
-        description: "Validate/resolve a US 5-digit ZIP code to address/depot info.",
+        description: "Validate a US ZIP code and get depot information",
         parameters: {
           type: "OBJECT",
           properties: {
-            zipcode: { type: "STRING", description: "5-digit US ZIP code" },
+            zipcode: { 
+              type: "STRING", 
+              description: "5-digit US ZIP code" 
+            },
           },
           required: ["zipcode"],
         },
       },
       {
-        name: "get_quote",
-        description: "Get a container quote for a given 5-digit US ZIP code.",
+        name: "get_container_quote",
+        description: "Get a shipping container quote for a given ZIP code",
         parameters: {
           type: "OBJECT",
           properties: {
-            zipcode: { type: "STRING" },
-            isDelivery: { type: "BOOLEAN" },
-            size: { type: "STRING" },
-            condition: { type: "STRING" },
-            quantity: { type: "NUMBER" },
+            zipcode: { 
+              type: "STRING",
+              description: "5-digit US ZIP code for delivery" 
+            },
+            size: { 
+              type: "STRING",
+              description: "Container size (20ft or 40ft)",
+              enum: ["20ft", "40ft"],
+              default: "20ft"
+            },
+            condition: { 
+              type: "STRING",
+              description: "Container condition",
+              enum: ["cargo-worthy", "wind-water-tight"],
+              default: "cargo-worthy"
+            },
+            quantity: { 
+              type: "NUMBER",
+              description: "Number of containers",
+              default: 1
+            },
           },
           required: ["zipcode"],
         },
@@ -60,241 +76,194 @@ const tools = [
 ];
 
 const app = express();
-app.use(
-  bodyParser.json({
-    verify: (req, _res, buf) => {
-      req.rawBody = buf; // اگر امضای فیس‌بوک رو می‌خوای چک کنی
-    },
-  })
-);
+app.use(bodyParser.json());
 
-/* ----------------- Messenger Verify (GET) ----------------- */
+/* ----------------- UsedConex API Helpers ----------------- */
+async function getAuthToken() {
+  try {
+    const response = await axios.post(
+      `${USEDCONEX_API}/client/v1/User/login/website`,
+      {},
+      { headers: { "Content-Type": "application/json" }, timeout: 10000 }
+    );
+    return response?.data?.data?.Token;
+  } catch (error) {
+    console.error("Login error:", error.message);
+    throw new Error("Failed to authenticate with UsedConex API");
+  }
+}
+
+async function getQuote({ zipcode, size = "20ft", condition = "cargo-worthy", quantity = 1 }) {
+  try {
+    const token = await getAuthToken();
+    const response = await axios.post(
+      `${USEDCONEX_API}${QUOTE_URL}`,
+      {
+        zipcode,
+        isDelivery: true,
+        items: [{ size, condition, quantity }],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        timeout: 15000,
+      }
+    );
+    
+    return response.data?.data || response.data;
+  } catch (error) {
+    console.error("Quote error:", error.response?.data || error.message);
+    throw new Error("Failed to get quote");
+  }
+}
+
+/* ----------------- Messenger Helpers ----------------- */
+async function sendMessage(recipientId, message) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v20.0/me/messages`,
+      {
+        recipient: { id: recipientId },
+        messaging_type: "RESPONSE",
+        message: { text: message },
+      },
+      {
+        params: { access_token: PAGE_ACCESS_TOKEN },
+        timeout: 10000,
+      }
+    );
+  } catch (error) {
+    console.error("Messenger send error:", error.response?.data || error.message);
+  }
+}
+
+/* ----------------- Webhook Endpoints ----------------- */
 app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("WEBHOOK_VERIFIED");
-    res.status(200).send(challenge);
+  if (req.query["hub.mode"] === "subscribe" && 
+      req.query["hub.verify_token"] === VERIFY_TOKEN) {
+    console.log("Webhook verified");
+    res.status(200).send(req.query["hub.challenge"]);
   } else {
     res.sendStatus(403);
   }
 });
 
-/* ----------------- UsedConex helpers ----------------- */
-async function ucLogin() {
-  const url = `${USEDCONEX_API}/client/v1/User/login/website`;
-  const res = await axios.post(
-    url,
-    {},
-    { headers: { "Content-Type": "application/json" }, timeout: 10000 }
-  );
-  const token = res?.data?.data?.Token;
-  if (!token) throw new Error("UC token not found");
-  return token;
-}
-
-async function ucZipLookup(zipcode) {
-  // اگر این GET نیاز به توکن ندارد، دو خط بعدی را حذف کن و headers را هم حذف کن
-  const token = await ucLogin();
-  const url = `${USEDCONEX_API}${ZIP_URL}/${zipcode}`;
-  const res = await axios.get(url, {
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    timeout: 10000,
-  });
-  return res.data;
-}
-
-async function ucQuote({
-  zipcode,
-  isDelivery = true,
-  size = "20ft",
-  condition = "cargo-worthy",
-  quantity = 1,
-}) {
-  const token = await ucLogin();
-  const url = `${USEDCONEX_API}${QUOTE_URL}`;
-  const payload = {
-    zipcode,
-    isDelivery,
-    items: [{ size, condition, quantity }],
-  };
-  const res = await axios.post(url, payload, {
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    timeout: 15000,
-  });
-  return res.data?.data || res.data;
-}
-
-/* ----------------- Messenger send API ----------------- */
-async function sendText(recipientId, text) {
-  const url = `https://graph.facebook.com/v20.0/me/messages?access_token=${encodeURIComponent(
-    PAGE_ACCESS_TOKEN
-  )}`;
-  const body = {
-    recipient: { id: recipientId },
-    messaging_type: "RESPONSE",
-    message: { text },
-  };
-  await axios.post(url, body, { timeout: 10000 });
-}
-
-/* ----------------- Webhook (POST) ----------------- */
 app.post("/webhook", async (req, res) => {
   try {
-    if (req.body.object !== "page") return res.sendStatus(404);
+    if (req.body.object !== "page") return res.sendStatus(200);
 
     for (const entry of req.body.entry || []) {
       const event = entry.messaging?.[0];
-      if (!event?.sender?.id) continue;
+      if (!event?.message || !event?.sender?.id) continue;
 
       const senderId = event.sender.id;
-      const userText = event.message?.text || "";
+      const messageText = event.message.text.trim();
 
-      const systemPrompt = [
-        "You are a helpful sales assistant for shipping containers.",
-        "If the user provides a ZIP, first call get_zip_info to validate/resolve it.",
-        "If the ZIP is valid and they ask for price/availability, call get_quote.",
-        "If no ZIP is found, ask politely for a 5-digit ZIP code.",
-        "Reply in clear, friendly English.",
-      ].join("\n");
+      // System prompt for Gemini
+      const systemPrompt = `
+        You are a helpful sales assistant for UsedConex shipping containers.
+        Your task is to help customers get price quotes for shipping containers.
+        
+        Rules:
+        1. Always ask for a 5-digit US ZIP code if not provided
+        2. For price inquiries, call get_container_quote with the ZIP code
+        3. Keep responses friendly and professional
+        4. Prices include delivery to the provided ZIP code
+        5. Default container is 20ft cargo-worthy (1 unit)
+        
+        Example responses:
+        - "Please provide a 5-digit ZIP code for delivery."
+        - "Here's your quote for 20ft container to ZIP 12345: $X (including delivery)"
+      `;
 
-      let convo = [
+      // Prepare conversation history
+      let conversation = [
         { role: "user", parts: [{ text: systemPrompt }] },
-        { role: "user", parts: [{ text: userText }] },
+        { role: "user", parts: [{ text: messageText }] },
       ];
 
-      let finalReply = null;
+      let finalResponse = null;
 
-      // تا 3 مرحله اجازه‌ی tool-calling
+      // Allow up to 3 steps for function calling
       for (let step = 0; step < 3; step++) {
-        const result = await model.generateContent({ tools, contents: convo });
-        const resp = result.response;
-        const parts = resp?.candidates?.[0]?.content?.parts || [];
-        const toolCalls = parts.filter((p) => p.functionCall);
+        const result = await model.generateContent({ 
+          tools, 
+          contents: conversation 
+        });
+        
+        const response = result.response;
+        const textParts = response?.candidates?.[0]?.content?.parts || [];
+        const toolCalls = textParts.filter(p => p.functionCall);
 
-        if (!toolCalls.length) {
-          finalReply = parts.map((p) => p.text).filter(Boolean).join(" ").trim();
+        if (toolCalls.length === 0) {
+          // No function calls - we have our final response
+          finalResponse = textParts.map(p => p.text).join(" ").trim();
           break;
         }
 
-        const call = toolCalls[0].functionCall;
-        const args = call.args || {};
+        // Process function calls
+        const functionCall = toolCalls[0].functionCall;
+        const args = functionCall.args || {};
 
-        if (call.name === "get_zip_info") {
-          const zip = (args.zipcode || "").toString().trim();
-          if (!/^\d{5}$/.test(zip)) {
-            await sendText(senderId, "Please provide a valid 5-digit ZIP code.");
-            finalReply = null;
-            break;
-          }
-          let toolResp;
+        if (functionCall.name === "get_container_quote") {
           try {
-            toolResp = await ucZipLookup(zip);
-          } catch (e) {
-            console.error("ZIP lookup error:", e?.response?.data || e.message);
-            await sendText(
-              senderId,
-              "I couldn’t validate that ZIP right now. Please try again shortly."
-            );
-            finalReply = null;
-            break;
-          }
+            // Validate ZIP code
+            const zipcode = (args.zipcode || "").toString().trim();
+            if (!/^\d{5}$/.test(zipcode)) {
+              await sendMessage(senderId, "Please provide a valid 5-digit ZIP code.");
+              break;
+            }
 
-          // feed back to model
-          convo.push({
-            role: "tool",
-            parts: [
-              {
-                functionResponse: {
-                  name: "get_zip_info",
-                  response: { name: "get_zip_info", content: toolResp },
-                },
-              },
-            ],
-          });
-          continue;
-        }
-
-        if (call.name === "get_quote") {
-          const zip = (args.zipcode || "").toString().trim();
-          if (!/^\d{5}$/.test(zip)) {
-            await sendText(senderId, "Please provide a valid 5-digit ZIP code.");
-            finalReply = null;
-            break;
-          }
-
-          let quoteResult;
-          try {
-            quoteResult = await ucQuote({
-              zipcode: zip,
-              isDelivery:
-                args.isDelivery !== undefined ? !!args.isDelivery : true,
+            // Get quote from API
+            const quoteData = await getQuote({
+              zipcode,
               size: args.size || "20ft",
               condition: args.condition || "cargo-worthy",
               quantity: Number(args.quantity || 1),
             });
-          } catch (e) {
-            console.error("UC quote error:", e?.response?.data || e.message);
-            await sendText(
-              senderId,
-              "Sorry, I couldn't retrieve a quote right now. Please try again in a moment."
-            );
-            finalReply = null;
-            break;
+
+            // Format the response
+            if (!quoteData || !quoteData.length) {
+              finalResponse = "Sorry, we don't have availability for that location.";
+              break;
+            }
+
+            const quote = quoteData[0];
+            const totalPrice = (quote.totalPrice + quote.totalTransport).toFixed(2);
+            
+            finalResponse = `Here's your quote for a ${args.size || "20ft"} container ` +
+                           `delivered to ${zipcode}: $${totalPrice} (including delivery).`;
+            
+          } catch (error) {
+            console.error("Quote processing error:", error);
+            finalResponse = "Sorry, I couldn't get a quote right now. Please try again later.";
           }
-
-          const composed = await model.generateContent({
-            tools,
-            contents: [
-              { role: "user", parts: [{ text: userText }] },
-              {
-                role: "tool",
-                parts: [
-                  {
-                    functionResponse: {
-                      name: "get_quote",
-                      response: { name: "get_quote", content: quoteResult },
-                    },
-                  },
-                ],
-              },
-            ],
-          });
-
-          finalReply =
-            composed?.response?.candidates?.[0]?.content?.parts
-              ?.map((p) => p.text)
-              .filter(Boolean)
-              .join(" ")
-              .trim() || `Here is your quote for ZIP ${zip}.`;
           break;
         }
 
-        await sendText(senderId, "Sorry, I can’t do that yet.");
-        finalReply = null;
-        break;
+        // Handle other function calls if needed
+        conversation.push({
+          role: "model",
+          parts: [{ functionCall }],
+        });
       }
 
-      if (finalReply) {
-        await sendText(senderId, finalReply);
+      if (finalResponse) {
+        await sendMessage(senderId, finalResponse);
       }
     }
 
     res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook error:", err);
+  } catch (error) {
+    console.error("Webhook error:", error);
     res.sendStatus(500);
   }
 });
 
-app.listen(3000, () => {
-  console.log("Webhook server running on port 3000");
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
