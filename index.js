@@ -4,76 +4,38 @@ const axios = require("axios");
 const { VertexAI } = require('@google-cloud/vertexai');
 require("dotenv").config();
 
-// Configuration
-const {
-  VERIFY_TOKEN,
-  PAGE_ACCESS_TOKEN,
-  GCLOUD_PROJECT,
-  VERTEX_LOCATION = "us-central1",
-  USEDCONEX_API = "https://api.usedconex.com",
-  ZIP_URL = "/client/v1/Order/zip",
-  QUOTE_URL = "/client/v1/Quote/create",
-} = process.env;
+// Validate environment variables
+const requiredEnvVars = [
+  'VERIFY_TOKEN',
+  'PAGE_ACCESS_TOKEN',
+  'VERTEX_API_KEY',
+  'VERTEX_ENDPOINT',
+  'USEDCONEX_API'
+];
+
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`Missing required environment variable: ${envVar}`);
+    process.exit(1);
+  }
+}
 
 // Initialize Vertex AI
 const vertexAI = new VertexAI({
-  project: GCLOUD_PROJECT,
-  location: VERTEX_LOCATION,
+  project: 'facebook-ai-agent', // Extracted from your endpoint URL
+  location: 'us-central1',
+  apiEndpoint: process.env.VERTEX_ENDPOINT,
 });
-const model = vertexAI.getGenerativeModel({ model: "gemini-1.5-pro" });
 
-// Tools for function calling
-const tools = [
-  {
-    functionDeclarations: [
-      {
-        name: "get_zip_info",
-        description: "Validate a US ZIP code and get depot information",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            zipcode: { 
-              type: "STRING", 
-              description: "5-digit US ZIP code" 
-            },
-          },
-          required: ["zipcode"],
-        },
-      },
-      {
-        name: "get_container_quote",
-        description: "Get a shipping container quote for a given ZIP code",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            zipcode: { 
-              type: "STRING",
-              description: "5-digit US ZIP code for delivery" 
-            },
-            size: { 
-              type: "STRING",
-              description: "Container size (20ft or 40ft)",
-              enum: ["20ft", "40ft"],
-              default: "20ft"
-            },
-            condition: { 
-              type: "STRING",
-              description: "Container condition",
-              enum: ["cargo-worthy", "wind-water-tight"],
-              default: "cargo-worthy"
-            },
-            quantity: { 
-              type: "NUMBER",
-              description: "Number of containers",
-              default: 1
-            },
-          },
-          required: ["zipcode"],
-        },
-      },
-    ],
-  },
-];
+const model = vertexAI.getGenerativeModel({
+  model: "gemini-1.5-pro",
+  safetySettings: {
+    harassment: "BLOCK_NONE",
+    hate: "BLOCK_NONE",
+    sexual: "BLOCK_NONE",
+    dangerous: "BLOCK_NONE"
+  }
+});
 
 const app = express();
 app.use(bodyParser.json());
@@ -82,7 +44,7 @@ app.use(bodyParser.json());
 async function getAuthToken() {
   try {
     const response = await axios.post(
-      `${USEDCONEX_API}/client/v1/User/login/website`,
+      `${process.env.USEDCONEX_API}/client/v1/User/login/website`,
       {},
       { headers: { "Content-Type": "application/json" }, timeout: 10000 }
     );
@@ -97,7 +59,7 @@ async function getQuote({ zipcode, size = "20ft", condition = "cargo-worthy", qu
   try {
     const token = await getAuthToken();
     const response = await axios.post(
-      `${USEDCONEX_API}${QUOTE_URL}`,
+      `${process.env.USEDCONEX_API}/client/v1/Quote/create`,
       {
         zipcode,
         isDelivery: true,
@@ -130,7 +92,7 @@ async function sendMessage(recipientId, message) {
         message: { text: message },
       },
       {
-        params: { access_token: PAGE_ACCESS_TOKEN },
+        params: { access_token: process.env.PAGE_ACCESS_TOKEN },
         timeout: 10000,
       }
     );
@@ -142,7 +104,7 @@ async function sendMessage(recipientId, message) {
 /* ----------------- Webhook Endpoints ----------------- */
 app.get("/webhook", (req, res) => {
   if (req.query["hub.mode"] === "subscribe" && 
-      req.query["hub.verify_token"] === VERIFY_TOKEN) {
+      req.query["hub.verify_token"] === process.env.VERIFY_TOKEN) {
     console.log("Webhook verified");
     res.status(200).send(req.query["hub.challenge"]);
   } else {
@@ -189,7 +151,6 @@ app.post("/webhook", async (req, res) => {
       // Allow up to 3 steps for function calling
       for (let step = 0; step < 3; step++) {
         const result = await model.generateContent({ 
-          tools, 
           contents: conversation 
         });
         
@@ -264,6 +225,7 @@ app.post("/webhook", async (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+const HOST = '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`Server running on http://${HOST}:${PORT}`);
 });
