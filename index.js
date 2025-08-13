@@ -1,233 +1,231 @@
-/** @format */
-/**
- * Secrets/Envs (با fly secrets ست کن):
- *  SA_JSON            ← کل محتوای JSON سرویس‌اکانت
- *  GCP_PROJECT_ID     ← مثلا facebook-ai-agent
- *  GCP_LOCATION       ← مثلا us-central1
- *  PAGE_ACCESS_TOKEN  ← توکن معتبر Page/System User
- *  VERIFY_TOKEN       ← توکن تأیید وبهوک
- *  USEDCONEX_API      ← https://api.usedconex.com
- * اختیاری:
- *  VERTEX_MODEL       ← پیش‌فرض gemini-1.5-pro
- */
-
-"use strict";
-
 const express = require("express");
+const bodyParser = require("body-parser");
 const axios = require("axios");
-const fs = require("fs");
-const path = require("path");
-const { GoogleAuth } = require("google-auth-library");
+const { VertexAI } = require('@google-cloud/vertexai');
+require("dotenv").config();
+
+// Validate environment variables
+const requiredEnvVars = [
+  'VERIFY_TOKEN',
+  'PAGE_ACCESS_TOKEN',
+  'VERTEX_API_KEY',
+  'VERTEX_ENDPOINT',
+  'USEDCONEX_API'
+];
+
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`Missing required environment variable: ${envVar}`);
+    process.exit(1);
+  }
+}
+
+// Initialize Vertex AI
+const vertexAI = new VertexAI({
+  project: 'facebook-ai-agent', // Extracted from your endpoint URL
+  location: 'us-central1',
+  apiEndpoint: process.env.VERTEX_ENDPOINT,
+});
+
+const model = vertexAI.getGenerativeModel({
+  model: "gemini-1.5-pro",
+  safetySettings: {
+    harassment: "BLOCK_NONE",
+    hate: "BLOCK_NONE",
+    sexual: "BLOCK_NONE",
+    dangerous: "BLOCK_NONE"
+  }
+});
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(bodyParser.json());
 
-/* ---------- ADC setup: ساخت فایل creds از Secret ---------- */
-(function setupADC() {
-  const saJson = process.env.SA_JSON;
-  if (saJson) {
-    const dir = "/secrets";
-    const p = path.join(dir, "sa.json");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(p, saJson);
-    process.env.GOOGLE_APPLICATION_CREDENTIALS = p;
-    console.log("✅ GOOGLE_APPLICATION_CREDENTIALS ->", p);
-  } else if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    console.warn("⚠️ SA_JSON not set and GOOGLE_APPLICATION_CREDENTIALS missing.");
-  }
-})();
-
-/* ---------- Health/Root ---------- */
-app.get("/", (_req, res) => res.status(200).send("ok"));
-app.get("/health", (_req, res) => res.status(200).send("ok"));
-
-/* ---------- Webhook verification (GET) ---------- */
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
-    console.log("✅ Webhook verified");
-    return res.status(200).send(challenge);
-  }
-  console.error("❌ Failed verification", { mode, token_present: !!token });
-  return res.sendStatus(403);
-});
-
-/* ---------- Message handler (POST) ---------- */
-app.post("/webhook", async (req, res) => {
+/* ----------------- UsedConex API Helpers ----------------- */
+async function getAuthToken() {
   try {
-    for (const entry of req.body.entry || []) {
-      for (const event of entry.messaging || []) {
-        // جلوگیری از لوپ
-        if (event.message?.is_echo) continue;
-
-        const senderId = event.sender?.id;
-        if (!senderId) continue;
-
-        const messageText =
-          event.message?.text ||
-          event.postback?.payload ||
-          event.postback?.title;
-        if (!messageText) continue;
-
-        try {
-          // 1) اگر ZIP یافت شد → کوئوت UsedConex
-          const zip = (messageText.match(/\b\d{5}\b/) || [])[0];
-          if (zip) {
-            const quote = await getUsedConexQuote(zip);
-            const total =
-              Number(quote?.totalPrice || 0) + Number(quote?.totalTransport || 0);
-            await sendMessage(
-              senderId,
-              `Price for ZIP ${zip}: $${total.toFixed(2)}`
-            );
-            continue;
-          }
-
-          // 2) در غیر این صورت → پاسخ Gemini
-          const reply = await generateAIResponse(messageText);
-          await sendMessage(senderId, reply);
-        } catch (innerErr) {
-          console.error("Error handling single event:", {
-            msg: innerErr?.message,
-            data: innerErr?.response?.data,
-            status: innerErr?.response?.status,
-          });
-          try {
-            await sendMessage(
-              senderId,
-              "Sorry, I'm having trouble processing your request."
-            );
-          } catch (_) {}
-        }
-      }
-    }
-    // مهم: همیشه 200 بده تا فیس‌بوک retry سنگین نکند
-    return res.sendStatus(200);
-  } catch (error) {
-    console.error("Webhook error:", {
-      msg: error?.message,
-      data: error?.response?.data,
-      status: error?.response?.status,
-    });
-    // باز هم 200 تا فیسبوک retry بی‌نهایت نکند
-    return res.sendStatus(200);
-  }
-});
-
-/* ---------- UsedConex Quote ---------- */
-async function getUsedConexQuote(zip) {
-  if (!process.env.USEDCONEX_API) throw new Error("USEDCONEX_API not set");
-  let token;
-  try {
-    const loginRes = await axios.post(
+    const response = await axios.post(
       `${process.env.USEDCONEX_API}/client/v1/User/login/website`,
       {},
-      { headers: { "Content-Type": "application/json" }, timeout: 15000 }
+      { headers: { "Content-Type": "application/json" }, timeout: 10000 }
     );
-    token = loginRes?.data?.data?.Token;
-    if (!token) throw new Error("No token returned from login");
-  } catch (e) {
-    const d = e.response?.data;
-    throw new Error(`UsedConex login failed: ${d?.message || e.message}`);
+    return response?.data?.data?.Token;
+  } catch (error) {
+    console.error("Login error:", error.message);
+    throw new Error("Failed to authenticate with UsedConex API");
   }
+}
 
+async function getQuote({ zipcode, size = "20ft", condition = "cargo-worthy", quantity = 1 }) {
   try {
-    const quoteRes = await axios.post(
+    const token = await getAuthToken();
+    const response = await axios.post(
       `${process.env.USEDCONEX_API}/client/v1/Quote/create`,
       {
-        zipcode: zip,
+        zipcode,
         isDelivery: true,
-        items: [{ size: "20ft", condition: "cargo-worthy", quantity: 1 }],
+        items: [{ size, condition, quantity }],
       },
       {
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        timeout: 20000,
-      }
-    );
-    const quote = quoteRes?.data?.data?.[0];
-    if (!quote) throw new Error("No quote returned");
-    return quote;
-  } catch (e) {
-    const d = e.response?.data;
-    throw new Error(`Quote API failed: ${d?.message || e.message}`);
-  }
-}
-
-/* ---------- Send message to Facebook ---------- */
-async function sendMessage(recipientId, text) {
-  try {
-    await axios.post(
-      "https://graph.facebook.com/v20.0/me/messages",
-      {
-        recipient: { id: recipientId },
-        messaging_type: "RESPONSE",
-        message: { text: String(text).slice(0, 1900) },
-      },
-      {
-        params: { access_token: process.env.PAGE_ACCESS_TOKEN },
-        headers: { "Content-Type": "application/json" },
         timeout: 15000,
       }
     );
+    
+    return response.data?.data || response.data;
   } catch (error) {
-    console.error("Facebook API Error:", {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message,
-    });
-    throw error;
+    console.error("Quote error:", error.response?.data || error.message);
+    throw new Error("Failed to get quote");
   }
 }
 
-/* ---------- Vertex AI (Gemini) via OAuth2 (بدون API Key) ---------- */
-const auth = new GoogleAuth({
-  scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+/* ----------------- Messenger Helpers ----------------- */
+async function sendMessage(recipientId, message) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v20.0/me/messages`,
+      {
+        recipient: { id: recipientId },
+        messaging_type: "RESPONSE",
+        message: { text: message },
+      },
+      {
+        params: { access_token: process.env.PAGE_ACCESS_TOKEN },
+        timeout: 10000,
+      }
+    );
+  } catch (error) {
+    console.error("Messenger send error:", error.response?.data || error.message);
+  }
+}
+
+/* ----------------- Webhook Endpoints ----------------- */
+app.get("/webhook", (req, res) => {
+  if (req.query["hub.mode"] === "subscribe" && 
+      req.query["hub.verify_token"] === process.env.VERIFY_TOKEN) {
+    console.log("Webhook verified");
+    res.status(200).send(req.query["hub.challenge"]);
+  } else {
+    res.sendStatus(403);
+  }
 });
 
-async function generateAIResponse(prompt) {
-  const project =
-    process.env.VERTEX_PROJECT || process.env.GCP_PROJECT_ID || "facebook-ai-agent";
-  const location =
-    process.env.VERTEX_LOCATION || process.env.GCP_LOCATION || "us-central1";
-  const model = process.env.VERTEX_MODEL || "gemini-1.5-pro";
-
-  // Endpoint صحیح: generateContent (نه predict) و بدون ?key
-  const url = `https://${location}-aiplatform.googleapis.com/v1/projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`;
-
-  const client = await auth.getClient();
-  const headers = await client.getRequestHeaders(); // شامل Authorization: Bearer <token>
-  headers["Content-Type"] = "application/json";
-  headers["x-goog-user-project"] = project; // مهم برای سهمیه/صورت‌حساب
-
+app.post("/webhook", async (req, res) => {
   try {
-    const { data } = await axios.post(
-      url,
-      { contents: [{ role: "user", parts: [{ text: prompt }] }] },
-      { headers, timeout: 20000 }
-    );
+    if (req.body.object !== "page") return res.sendStatus(200);
 
-    const text =
-      (data?.candidates?.[0]?.content?.parts || [])
-        .map((p) => p.text || "")
-        .join("")
-        .trim() || "I couldn't generate a response.";
-    return text;
-  } catch (e) {
-    console.error("Vertex AI Error:", {
-      status: e.response?.status,
-      data: e.response?.data,
-      message: e.message,
-    });
-    return "I couldn't generate a response right now.";
+    for (const entry of req.body.entry || []) {
+      const event = entry.messaging?.[0];
+      if (!event?.message || !event?.sender?.id) continue;
+
+      const senderId = event.sender.id;
+      const messageText = event.message.text.trim();
+
+      // System prompt for Gemini
+      const systemPrompt = `
+        You are a helpful sales assistant for UsedConex shipping containers.
+        Your task is to help customers get price quotes for shipping containers.
+        
+        Rules:
+        1. Always ask for a 5-digit US ZIP code if not provided
+        2. For price inquiries, call get_container_quote with the ZIP code
+        3. Keep responses friendly and professional
+        4. Prices include delivery to the provided ZIP code
+        5. Default container is 20ft cargo-worthy (1 unit)
+        
+        Example responses:
+        - "Please provide a 5-digit ZIP code for delivery."
+        - "Here's your quote for 20ft container to ZIP 12345: $X (including delivery)"
+      `;
+
+      // Prepare conversation history
+      let conversation = [
+        { role: "user", parts: [{ text: systemPrompt }] },
+        { role: "user", parts: [{ text: messageText }] },
+      ];
+
+      let finalResponse = null;
+
+      // Allow up to 3 steps for function calling
+      for (let step = 0; step < 3; step++) {
+        const result = await model.generateContent({ 
+          contents: conversation 
+        });
+        
+        const response = result.response;
+        const textParts = response?.candidates?.[0]?.content?.parts || [];
+        const toolCalls = textParts.filter(p => p.functionCall);
+
+        if (toolCalls.length === 0) {
+          // No function calls - we have our final response
+          finalResponse = textParts.map(p => p.text).join(" ").trim();
+          break;
+        }
+
+        // Process function calls
+        const functionCall = toolCalls[0].functionCall;
+        const args = functionCall.args || {};
+
+        if (functionCall.name === "get_container_quote") {
+          try {
+            // Validate ZIP code
+            const zipcode = (args.zipcode || "").toString().trim();
+            if (!/^\d{5}$/.test(zipcode)) {
+              await sendMessage(senderId, "Please provide a valid 5-digit ZIP code.");
+              break;
+            }
+
+            // Get quote from API
+            const quoteData = await getQuote({
+              zipcode,
+              size: args.size || "20ft",
+              condition: args.condition || "cargo-worthy",
+              quantity: Number(args.quantity || 1),
+            });
+
+            // Format the response
+            if (!quoteData || !quoteData.length) {
+              finalResponse = "Sorry, we don't have availability for that location.";
+              break;
+            }
+
+            const quote = quoteData[0];
+            const totalPrice = (quote.totalPrice + quote.totalTransport).toFixed(2);
+            
+            finalResponse = `Here's your quote for a ${args.size || "20ft"} container ` +
+                           `delivered to ${zipcode}: $${totalPrice} (including delivery).`;
+            
+          } catch (error) {
+            console.error("Quote processing error:", error);
+            finalResponse = "Sorry, I couldn't get a quote right now. Please try again later.";
+          }
+          break;
+        }
+
+        // Handle other function calls if needed
+        conversation.push({
+          role: "model",
+          parts: [{ functionCall }],
+        });
+      }
+
+      if (finalResponse) {
+        await sendMessage(senderId, finalResponse);
+      }
+    }
+
+    res.sendStatus(200);
+  } catch (error) {
+    console.error("Webhook error:", error);
+    res.sendStatus(500);
   }
-}
+});
 
-/* ---------- Start server ---------- */
+// Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const HOST = '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`Server running on http://${HOST}:${PORT}`);
+});
