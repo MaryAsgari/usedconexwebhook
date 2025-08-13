@@ -1,54 +1,80 @@
 /** @format */
+/**
+ * Envهای لازم (به‌صورت Fly secrets ست کن، نه .env داخل ریپو):
+ *  SA_JSON            ← محتوای JSON سرویس‌اکانت (کل محتوا)
+ *  GCP_PROJECT_ID     ← مثلا facebook-ai-agent
+ *  GCP_LOCATION       ← مثلا us-central1
+ *  PAGE_ACCESS_TOKEN  ← Page/System User token معتبر
+ *  VERIFY_TOKEN       ← توکن تأیید وبهوک
+ *  USEDCONEX_API      ← https://api.usedconex.com
+ * اختیاری:
+ *  VERTEX_MODEL       ← پیش‌فرض gemini-1.5-pro
+ */
+
+"use strict";
+
 const express = require("express");
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const { GoogleAuth } = require("google-auth-library");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
-// --- Healthcheck ---
+/* ---------- ADC setup: ساخت فایل creds از Secret ---------- */
+(function setupADC() {
+  const saJson = process.env.SA_JSON;
+  if (saJson) {
+    const dir = "/secrets";
+    const p = path.join(dir, "sa.json");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(p, saJson);
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = p;
+    console.log("✅ GOOGLE_APPLICATION_CREDENTIALS ->", p);
+  } else if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    console.warn("⚠️ SA_JSON not set and GOOGLE_APPLICATION_CREDENTIALS missing.");
+  }
+})();
+
+/* ---------- Healthcheck ---------- */
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// --- Facebook Webhook Verification ---
+/* ---------- Webhook verification (GET) ---------- */
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
-    console.log("Webhook verified");
+    console.log("✅ Webhook verified");
     return res.status(200).send(challenge);
   }
-  console.error("Failed verification", { mode, token_present: !!token });
+  console.error("❌ Failed verification", { mode, token_present: !!token });
   return res.sendStatus(403);
 });
 
-// --- Message Handler ---
+/* ---------- Message handler (POST) ---------- */
 app.post("/webhook", async (req, res) => {
   try {
-    // Meta ممکنه چند entry بده
-    const entries = req.body.entry || [];
-    for (const entry of entries) {
-      const messagingEvents = entry.messaging || [];
-      for (const event of messagingEvents) {
-        // نادیده بگیر echo/seen/delivery
+    for (const entry of req.body.entry || []) {
+      for (const event of entry.messaging || []) {
+        // جلوگیری از لوپ
         if (event.message?.is_echo) continue;
 
         const senderId = event.sender?.id;
         if (!senderId) continue;
 
-        // متن پیام یا postback
         const messageText =
           event.message?.text ||
           event.postback?.payload ||
           event.postback?.title;
-
         if (!messageText) continue;
 
         try {
-          // 1) اگر ZIP پیدا شد، قیمت UsedConex
-          const zipMatch = messageText.match(/\b\d{5}\b/);
-          if (zipMatch) {
-            const zip = zipMatch[0];
+          // 1) اگر ZIP یافت شد → کوئوت UsedConex
+          const zip = (messageText.match(/\b\d{5}\b/) || [])[0];
+          if (zip) {
             const quote = await getUsedConexQuote(zip);
             const total =
               Number(quote?.totalPrice || 0) + Number(quote?.totalTransport || 0);
@@ -59,16 +85,15 @@ app.post("/webhook", async (req, res) => {
             continue;
           }
 
-          // 2) در غیر اینصورت پاسخ Gemini
-          const responseText = await generateAIResponse(messageText);
-          await sendMessage(senderId, responseText);
+          // 2) در غیر این صورت → پاسخ Gemini
+          const reply = await generateAIResponse(messageText);
+          await sendMessage(senderId, reply);
         } catch (innerErr) {
           console.error("Error handling single event:", {
             msg: innerErr?.message,
             data: innerErr?.response?.data,
             status: innerErr?.response?.status,
           });
-          // تلاش برای ارسال پیام خطا به کاربر
           try {
             await sendMessage(
               senderId,
@@ -78,7 +103,7 @@ app.post("/webhook", async (req, res) => {
         }
       }
     }
-
+    // مهم: همیشه 200 بده تا فیس‌بوک retry سنگین نکند
     return res.sendStatus(200);
   } catch (error) {
     console.error("Webhook error:", {
@@ -86,12 +111,13 @@ app.post("/webhook", async (req, res) => {
       data: error?.response?.data,
       status: error?.response?.status,
     });
-    return res.sendStatus(500);
+    return res.sendStatus(200);
   }
 });
 
-// --- UsedConex Quote ---
+/* ---------- UsedConex Quote ---------- */
 async function getUsedConexQuote(zip) {
+  if (!process.env.USEDCONEX_API) throw new Error("USEDCONEX_API not set");
   let token;
   try {
     const loginRes = await axios.post(
@@ -122,7 +148,6 @@ async function getUsedConexQuote(zip) {
         timeout: 20000,
       }
     );
-
     const quote = quoteRes?.data?.data?.[0];
     if (!quote) throw new Error("No quote returned");
     return quote;
@@ -132,15 +157,15 @@ async function getUsedConexQuote(zip) {
   }
 }
 
-// --- Send message to Facebook ---
+/* ---------- Send message to Facebook ---------- */
 async function sendMessage(recipientId, text) {
   try {
     await axios.post(
       "https://graph.facebook.com/v20.0/me/messages",
       {
         recipient: { id: recipientId },
-        messaging_type: "RESPONSE", // لازم برای Send API
-        message: { text: String(text).slice(0, 2000) }, // حداکثر طول مناسب
+        messaging_type: "RESPONSE",
+        message: { text: String(text).slice(0, 1900) },
       },
       {
         params: { access_token: process.env.PAGE_ACCESS_TOKEN },
@@ -158,32 +183,42 @@ async function sendMessage(recipientId, text) {
   }
 }
 
-// --- Vertex AI (Gemini) via REST ---
+/* ---------- Vertex AI (Gemini) via OAuth2, no API key ---------- */
+const auth = new GoogleAuth({
+  scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+});
+
 async function generateAIResponse(prompt) {
-  const endpoint =
-    process.env.VERTEX_ENDPOINT ||
-    `https://us-central1-aiplatform.googleapis.com/v1/projects/${
-      process.env.VERTEX_PROJECT || "facebook-ai-agent"
-    }/locations/${
-      process.env.VERTEX_LOCATION || "us-central1"
-    }/publishers/google/models/gemini-1.5-pro:generateContent`;
+  const project =
+    process.env.VERTEX_PROJECT || process.env.GCP_PROJECT_ID || "facebook-ai-agent";
+  const location =
+    process.env.VERTEX_LOCATION || process.env.GCP_LOCATION || "us-central1";
+  const model = process.env.VERTEX_MODEL || "gemini-1.5-pro";
+
+  // Endpoint صحیح: generateContent (نه predict) و بدون ?key
+  const url = `https://${location}-aiplatform.googleapis.com/v1/projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`;
+
+  const client = await auth.getClient();
+  const accessToken = await client.getAccessToken();
 
   try {
     const { data } = await axios.post(
-      `${endpoint}?key=${process.env.VERTEX_API_KEY}`,
+      url,
+      { contents: [{ role: "user", parts: [{ text: prompt }] }] },
       {
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        // در صورت نیاز: safetySettings، generationConfig
-      },
-      {
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
         timeout: 20000,
       }
     );
 
     const text =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
-      "I couldn't generate a response.";
+      (data?.candidates?.[0]?.content?.parts || [])
+        .map((p) => p.text || "")
+        .join("")
+        .trim() || "I couldn't generate a response.";
     return text;
   } catch (e) {
     console.error("Vertex AI Error:", {
@@ -195,6 +230,6 @@ async function generateAIResponse(prompt) {
   }
 }
 
-// --- Start server ---
+/* ---------- Start server ---------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
