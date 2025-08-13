@@ -1,127 +1,200 @@
+/** @format */
 const express = require("express");
 const axios = require("axios");
-const { VertexAI } = require("@google-cloud/vertexai");
 
 const app = express();
 app.use(express.json());
 
-// Initialize Vertex AI with API Key
-const vertexAI = new VertexAI({
-  project: "facebook-ai-agent",
-  location: "us-central1",
-  apiEndpoint: process.env.VERTEX_ENDPOINT,
-  googleAuthOptions: {
-    credentials: {
-      client_email: "api-key@project.iam.gserviceaccount.com", // dummy email
-      private_key: process.env.VERTEX_API_KEY
-    }
-  }
-});
+// --- Healthcheck ---
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-const model = vertexAI.getGenerativeModel({
-  model: "gemini-1.5-pro",
-  safetySettings: {
-    harassment: "BLOCK_NONE",
-    hate: "BLOCK_NONE", 
-    sexual: "BLOCK_NONE",
-    dangerous: "BLOCK_NONE"
-  }
-});
-
-// Facebook Webhook Verification
+// --- Facebook Webhook Verification ---
 app.get("/webhook", (req, res) => {
-  if (req.query["hub.mode"] === "subscribe" &&
-      req.query["hub.verify_token"] === process.env.VERTIFY_TOKEN) {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
     console.log("Webhook verified");
-    res.status(200).send(req.query["hub.challenge"]);
-  } else {
-    console.error("Failed verification");
-    res.sendStatus(403);
+    return res.status(200).send(challenge);
   }
+  console.error("Failed verification", { mode, token_present: !!token });
+  return res.sendStatus(403);
 });
 
-// Message Handler
+// --- Message Handler ---
 app.post("/webhook", async (req, res) => {
   try {
-    const event = req.body.entry?.[0]?.messaging?.[0];
-    if (!event) return res.sendStatus(200);
+    // Meta ممکنه چند entry بده
+    const entries = req.body.entry || [];
+    for (const entry of entries) {
+      const messagingEvents = entry.messaging || [];
+      for (const event of messagingEvents) {
+        // نادیده بگیر echo/seen/delivery
+        if (event.message?.is_echo) continue;
 
-    const senderId = event.sender.id;
-    const messageText = event.message?.text;
+        const senderId = event.sender?.id;
+        if (!senderId) continue;
 
-    if (messageText) {
-      try {
-        // Try to get ZIP code
-        const zipMatch = messageText.match(/\b\d{5}\b/);
-        if (zipMatch) {
-          const zip = zipMatch[0];
-          const quote = await getUsedConexQuote(zip);
-          await sendMessage(senderId, `Price for ZIP ${zip}: $${quote.totalPrice + quote.totalTransport}`);
-          return res.sendStatus(200);
+        // متن پیام یا postback
+        const messageText =
+          event.message?.text ||
+          event.postback?.payload ||
+          event.postback?.title;
+
+        if (!messageText) continue;
+
+        try {
+          // 1) اگر ZIP پیدا شد، قیمت UsedConex
+          const zipMatch = messageText.match(/\b\d{5}\b/);
+          if (zipMatch) {
+            const zip = zipMatch[0];
+            const quote = await getUsedConexQuote(zip);
+            const total =
+              Number(quote?.totalPrice || 0) + Number(quote?.totalTransport || 0);
+            await sendMessage(
+              senderId,
+              `Price for ZIP ${zip}: $${total.toFixed(2)}`
+            );
+            continue;
+          }
+
+          // 2) در غیر اینصورت پاسخ Gemini
+          const responseText = await generateAIResponse(messageText);
+          await sendMessage(senderId, responseText);
+        } catch (innerErr) {
+          console.error("Error handling single event:", {
+            msg: innerErr?.message,
+            data: innerErr?.response?.data,
+            status: innerErr?.response?.status,
+          });
+          // تلاش برای ارسال پیام خطا به کاربر
+          try {
+            await sendMessage(
+              senderId,
+              "Sorry, I'm having trouble processing your request."
+            );
+          } catch (_) {}
         }
-
-        // Fallback to AI response
-        const result = await model.generateContent({
-          contents: [{ role: "user", parts: [{ text: messageText }] }]
-        });
-        const responseText = result.response.candidates[0].content.parts[0].text;
-        await sendMessage(senderId, responseText);
-      } catch (error) {
-        console.error("Error handling message:", error);
-        await sendMessage(senderId, "Sorry, I'm having trouble processing your request.");
       }
     }
-    
-    res.sendStatus(200);
+
+    return res.sendStatus(200);
   } catch (error) {
-    console.error("Webhook error:", error);
-    res.sendStatus(500);
+    console.error("Webhook error:", {
+      msg: error?.message,
+      data: error?.response?.data,
+      status: error?.response?.status,
+    });
+    return res.sendStatus(500);
   }
 });
 
+// --- UsedConex Quote ---
 async function getUsedConexQuote(zip) {
-  const token = await axios.post(
-    `${process.env.USEDCONEX_API}/client/v1/User/login/website`,
-    {},
-    { headers: { "Content-Type": "application/json" } }
-  ).then(res => res.data.data.Token);
+  let token;
+  try {
+    const loginRes = await axios.post(
+      `${process.env.USEDCONEX_API}/client/v1/User/login/website`,
+      {},
+      { headers: { "Content-Type": "application/json" }, timeout: 15000 }
+    );
+    token = loginRes?.data?.data?.Token;
+    if (!token) throw new Error("No token returned from login");
+  } catch (e) {
+    const d = e.response?.data;
+    throw new Error(`UsedConex login failed: ${d?.message || e.message}`);
+  }
 
-  const quote = await axios.post(
-    `${process.env.USEDCONEX_API}/client/v1/Quote/create`,
-    {
-      zipcode: zip,
-      isDelivery: true,
-      items: [{ size: "20ft", condition: "cargo-worthy", quantity: 1 }]
-    },
-    { 
-      headers: { 
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}` 
+  try {
+    const quoteRes = await axios.post(
+      `${process.env.USEDCONEX_API}/client/v1/Quote/create`,
+      {
+        zipcode: zip,
+        isDelivery: true,
+        items: [{ size: "20ft", condition: "cargo-worthy", quantity: 1 }],
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        timeout: 20000,
       }
-    }
-  ).then(res => res.data.data[0]);
+    );
 
-  return quote;
+    const quote = quoteRes?.data?.data?.[0];
+    if (!quote) throw new Error("No quote returned");
+    return quote;
+  } catch (e) {
+    const d = e.response?.data;
+    throw new Error(`Quote API failed: ${d?.message || e.message}`);
+  }
 }
 
+// --- Send message to Facebook ---
 async function sendMessage(recipientId, text) {
   try {
     await axios.post(
-      `https://graph.facebook.com/v20.0/me/messages`,
+      "https://graph.facebook.com/v20.0/me/messages",
       {
         recipient: { id: recipientId },
-        message: { text: text }
+        messaging_type: "RESPONSE", // لازم برای Send API
+        message: { text: String(text).slice(0, 2000) }, // حداکثر طول مناسب
       },
-      { 
+      {
         params: { access_token: process.env.PAGE_ACCESS_TOKEN },
-        headers: { "Content-Type": "application/json" }
+        headers: { "Content-Type": "application/json" },
+        timeout: 15000,
       }
     );
   } catch (error) {
-    console.error("Facebook API Error:", error.response?.data || error.message);
+    console.error("Facebook API Error:", {
+      status: error.response?.status,
+      data: error.response?.data,
+      message: error.message,
+    });
     throw error;
   }
 }
 
+// --- Vertex AI (Gemini) via REST ---
+async function generateAIResponse(prompt) {
+  const endpoint =
+    process.env.VERTEX_ENDPOINT ||
+    `https://us-central1-aiplatform.googleapis.com/v1/projects/${
+      process.env.VERTEX_PROJECT || "facebook-ai-agent"
+    }/locations/${
+      process.env.VERTEX_LOCATION || "us-central1"
+    }/publishers/google/models/gemini-1.5-pro:generateContent`;
+
+  try {
+    const { data } = await axios.post(
+      `${endpoint}?key=${process.env.VERTEX_API_KEY}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        // در صورت نیاز: safetySettings، generationConfig
+      },
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: 20000,
+      }
+    );
+
+    const text =
+      data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ||
+      "I couldn't generate a response.";
+    return text;
+  } catch (e) {
+    console.error("Vertex AI Error:", {
+      status: e.response?.status,
+      data: e.response?.data,
+      message: e.message,
+    });
+    return "I couldn't generate a response right now.";
+  }
+}
+
+// --- Start server ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
