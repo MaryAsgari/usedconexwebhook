@@ -1,10 +1,10 @@
 /** @format */
 /**
- * Envهای لازم (به‌صورت Fly secrets ست کن، نه .env داخل ریپو):
- *  SA_JSON            ← محتوای JSON سرویس‌اکانت (کل محتوا)
+ * Secrets/Envs (با fly secrets ست کن):
+ *  SA_JSON            ← کل محتوای JSON سرویس‌اکانت
  *  GCP_PROJECT_ID     ← مثلا facebook-ai-agent
  *  GCP_LOCATION       ← مثلا us-central1
- *  PAGE_ACCESS_TOKEN  ← Page/System User token معتبر
+ *  PAGE_ACCESS_TOKEN  ← توکن معتبر Page/System User
  *  VERIFY_TOKEN       ← توکن تأیید وبهوک
  *  USEDCONEX_API      ← https://api.usedconex.com
  * اختیاری:
@@ -37,7 +37,8 @@ app.use(express.json({ limit: "2mb" }));
   }
 })();
 
-/* ---------- Healthcheck ---------- */
+/* ---------- Health/Root ---------- */
+app.get("/", (_req, res) => res.status(200).send("ok"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 /* ---------- Webhook verification (GET) ---------- */
@@ -111,6 +112,7 @@ app.post("/webhook", async (req, res) => {
       data: error?.response?.data,
       status: error?.response?.status,
     });
+    // باز هم 200 تا فیسبوک retry بی‌نهایت نکند
     return res.sendStatus(200);
   }
 });
@@ -183,7 +185,7 @@ async function sendMessage(recipientId, text) {
   }
 }
 
-/* ---------- Vertex AI (Gemini) via OAuth2, no API key ---------- */
+/* ---------- Vertex AI (Gemini) via OAuth2 (بدون API Key) ---------- */
 const auth = new GoogleAuth({
   scopes: ["https://www.googleapis.com/auth/cloud-platform"],
 });
@@ -199,19 +201,15 @@ async function generateAIResponse(prompt) {
   const url = `https://${location}-aiplatform.googleapis.com/v1/projects/${project}/locations/${location}/publishers/google/models/${model}:generateContent`;
 
   const client = await auth.getClient();
-  const accessToken = await client.getAccessToken();
+  const headers = await client.getRequestHeaders(); // شامل Authorization: Bearer <token>
+  headers["Content-Type"] = "application/json";
+  headers["x-goog-user-project"] = project; // مهم برای سهمیه/صورت‌حساب
 
   try {
     const { data } = await axios.post(
       url,
       { contents: [{ role: "user", parts: [{ text: prompt }] }] },
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 20000,
-      }
+      { headers, timeout: 20000 }
     );
 
     const text =
