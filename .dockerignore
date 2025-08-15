@@ -1,4 +1,10 @@
 node_modules
 npm-debug.log
+.git
+.gitignore
+Dockerfile
+docker-entrypoint.sh
+fly.toml
+*.md
 .env
-.facebook-ai-agent.json
+.env.*
