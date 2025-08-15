@@ -35,11 +35,19 @@ for (const k of requiredEnv) {
 
 let sa;
 try {
-  sa = JSON.parse(process.env.GCP_SA_KEY);
+  if (process.env.GCP_SA_KEY_B64) {
+    const json = Buffer.from(process.env.GCP_SA_KEY_B64, 'base64').toString('utf8');
+    sa = JSON.parse(json);
+  } else if (process.env.GCP_SA_KEY?.trim().startsWith('{')) {
+    sa = JSON.parse(process.env.GCP_SA_KEY);
+  } else {
+    throw new Error('No valid GCP service account key provided');
+  }
 } catch (e) {
-  console.error("Invalid GCP_SA_KEY JSON:", e.message);
+  console.error('Invalid GCP_SA_KEY(_B64):', e.message);
   process.exit(1);
 }
+
 
 /* ----------------- App & Raw Body for Signature ----------------- */
 const app = express();
