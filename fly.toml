@@ -3,20 +3,21 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'usedconex-webhook-yourid'
-primary_region = 'iad'
+# fly.toml
+app = "usedconex-webhook-wandering"
+primary_region = "fra"
 
 [build]
-  dockerfile = 'Dockerfile'
-
-[env]
-  PORT = '3000'
+  dockerfile = "Dockerfile"
 
 [http_service]
   internal_port = 3000
-  auto_stop_machines = false
+  force_https = true
+  auto_stop_machines = true
   auto_start_machines = true
-  min_machines_running = 1
+  min_machines_running = 1   # برای گرم نگه داشتن، مخصوصاً وبهوک
+  processes = ["app"]
+
 
   [http_service.concurrency]
     type = 'connections'
