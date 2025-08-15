@@ -1,6 +1,10 @@
-/** server.js - Facebook Messenger × VertexAI (Gemini) × UsedConex
- *  Run: node server.js
- *  Env: VERIFY_TOKEN, PAGE_ACCESS_TOKEN, APP_SECRET, GCP_PROJECT_ID, GCP_LOCATION, USEDCONEX_API, (optional) VERTEX_ENDPOINT, PORT
+/** index.js - Facebook Messenger × Vertex AI (Gemini) × UsedConex
+ * Run: node index.js
+ * Env (required):
+ *   VERIFY_TOKEN, PAGE_ACCESS_TOKEN, APP_SECRET,
+ *   GCP_PROJECT_ID, GCP_LOCATION, GCP_SA_KEY, USEDCONEX_API
+ * Env (optional):
+ *   VERTEX_ENDPOINT (e.g. us-central1-aiplatform.googleapis.com), PORT
  */
 
 "use strict";
@@ -20,6 +24,7 @@ const requiredEnv = [
   "GCP_PROJECT_ID",
   "GCP_LOCATION",
   "USEDCONEX_API",
+  "GCP_SA_KEY",
 ];
 for (const k of requiredEnv) {
   if (!process.env[k]) {
@@ -28,13 +33,20 @@ for (const k of requiredEnv) {
   }
 }
 
+let sa;
+try {
+  sa = JSON.parse(process.env.GCP_SA_KEY);
+} catch (e) {
+  console.error("Invalid GCP_SA_KEY JSON:", e.message);
+  process.exit(1);
+}
+
 /* ----------------- App & Raw Body for Signature ----------------- */
 const app = express();
-// Keep raw body for signature verification
 app.use(
   bodyParser.json({
     verify: (req, _res, buf) => {
-      req.rawBody = buf;
+      req.rawBody = buf; // برای امضای فیس‌بوک لازم است
     },
   })
 );
@@ -47,13 +59,12 @@ function verifyFbSignature(req) {
   if (algo !== "sha256" || !theirHash) throw new Error("Bad signature format");
   const expected = crypto
     .createHmac("sha256", process.env.APP_SECRET)
-    .update(req.rawBody)
+    .update(req.rawBody || Buffer.from(""))
     .digest("hex");
   if (theirHash !== expected) throw new Error("Invalid signature");
 }
 
 /* ----------------- Vertex AI (Gemini) ----------------- */
-// Define tool (function calling) schema
 const tools = [
   {
     functionDeclarations: [
@@ -115,10 +126,10 @@ Examples:
 const vertex = new VertexAI({
   project: process.env.GCP_PROJECT_ID,
   location: process.env.GCP_LOCATION,
-  apiEndpoint: process.env.VERTEX_ENDPOINT, // optional
+  apiEndpoint: process.env.VERTEX_ENDPOINT, // e.g. us-central1-aiplatform.googleapis.com
+  credentials: sa,
 });
 
-// Configure model with systemInstruction, tools, safety
 const model = vertex.getGenerativeModel({
   model: "gemini-1.5-pro",
   systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
@@ -133,7 +144,6 @@ const model = vertex.getGenerativeModel({
 
 /* ----------------- UsedConex API helpers ----------------- */
 async function getAuthToken() {
-  // NOTE: اگر API شما credential لازم دارد، اینجا اضافه کنید.
   const url = `${process.env.USEDCONEX_API}/client/v1/User/login/website`;
   try {
     const res = await axios.post(
@@ -171,10 +181,8 @@ async function getQuoteFromUsedConex({
       },
       timeout: 20000,
     });
-    // ساختار پاسخ را منعطف بخوانیم
     const data = res?.data?.data ?? res?.data;
     if (!data) throw new Error("Empty quote data");
-    // ممکن است آرایه یا آبجکت باشد
     const item = Array.isArray(data) ? data[0] : data;
     const total =
       Number(item?.totalPrice || 0) + Number(item?.totalTransport || 0);
@@ -200,14 +208,11 @@ async function sendSenderAction(recipientId, action = "typing_on") {
   try {
     await axios.post(
       `${graphBase}/me/messages`,
-      {
-        recipient: { id: recipientId },
-        sender_action: action, // typing_on | typing_off | mark_seen
-      },
+      { recipient: { id: recipientId }, sender_action: action },
       { params: { access_token: pageToken }, timeout: 8000 }
     );
-  } catch (e) {
-    // no-op
+  } catch {
+    /* no-op */
   }
 }
 
@@ -237,9 +242,8 @@ async function sendText(recipientId, text, attempt = 1) {
 const ZIP_RE = /\b(\d{5})(?:-\d{4})?\b/;
 function extractZip(text = "") {
   const m = text.match(ZIP_RE);
-  return m ? m[1] : null; // فقط ۵ رقمی اول را برگردان
+  return m ? m[1] : null;
 }
-
 function sanitizeQuantity(q) {
   const n = Number(q);
   return Number.isInteger(n) && n > 0 ? n : 1;
@@ -261,22 +265,17 @@ app.get("/webhook", (req, res) => {
 /* ----------------- Webhook: Receive ----------------- */
 app.post("/webhook", async (req, res) => {
   try {
-    // Verify signature (throws if invalid)
-    verifyFbSignature(req);
+    verifyFbSignature(req); // throws on invalid
 
     const body = req.body;
-    if (body.object !== "page") {
-      return res.sendStatus(200);
-    }
+    if (body.object !== "page") return res.sendStatus(200);
 
-    // Each entry can contain multiple messaging events
     for (const entry of body.entry || []) {
       const events = entry.messaging || [];
       for (const event of events) {
         const senderId = event?.sender?.id;
         if (!senderId) continue;
 
-        // mark seen + typing
         await sendSenderAction(senderId, "mark_seen");
         await sendSenderAction(senderId, "typing_on");
 
@@ -285,13 +284,11 @@ app.post("/webhook", async (req, res) => {
             const text = (event.message.text || "").trim();
             await handleUserText(senderId, text);
           } else if (event.message?.attachments) {
-            // If location/image/file: ask for ZIP
             await sendText(
               senderId,
               "برای محاسبه قیمت، لطفاً یک ZIP کد ۵ رقمی آمریکا ارسال کنید."
             );
           } else {
-            // Other event types (postbacks, etc.)
             await sendText(
               senderId,
               "سلام! برای دریافت قیمت لطفاً یک ZIP کد ۵ رقمی آمریکا بفرستید."
@@ -312,7 +309,6 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(200);
   } catch (err) {
     console.error("Webhook error:", err.message);
-    // Signature failures should be 403; others 500
     if (/signature/i.test(err.message)) return res.sendStatus(403);
     return res.sendStatus(500);
   }
@@ -320,9 +316,7 @@ app.post("/webhook", async (req, res) => {
 
 /* ----------------- Handler: User Text via Gemini ----------------- */
 async function handleUserText(senderId, messageText) {
-  // Try to guide Gemini with tools; also have local fallback extraction
-
-  // 1) Ask Gemini with tools
+  // 1) Ask Gemini with tool use
   const contents = [{ role: "user", parts: [{ text: messageText }] }];
   let gen;
   try {
@@ -333,6 +327,7 @@ async function handleUserText(senderId, messageText) {
 
   const parts = gen?.response?.candidates?.[0]?.content?.parts || [];
   const toolPart = parts.find((p) => p.functionCall);
+
   if (toolPart?.functionCall?.name === "get_container_quote") {
     const args = toolPart.functionCall.args || {};
     const zipcode = String(args.zipcode || "").trim();
@@ -370,10 +365,10 @@ $${price} (با احتساب هزینه ارسال). اگر مایل هستید�
     return;
   }
 
-  // 2) If no functionCall, see if Gemini produced text to send
+  // 2) If no functionCall, see if Gemini produced text
   const textAnswer = parts.map((p) => p.text).filter(Boolean).join(" ").trim();
 
-  // 3) Fallback: try local ZIP extraction to auto-quote
+  // 3) Fallback: local ZIP extraction to auto-quote
   const zip = extractZip(messageText);
   if (zip) {
     const quote = await getQuoteFromUsedConex({
@@ -403,8 +398,22 @@ $${price} (با احتساب هزینه ارسال). اگر مایل هستید�
   }
 }
 
-/* ----------------- Health ----------------- */
+/* ----------------- Health & Debug ----------------- */
 app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
+
+app.get("/debug/vertex", async (_req, res) => {
+  try {
+    const out = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: "ping" }] }],
+    });
+    const txt =
+      out?.response?.candidates?.[0]?.content?.parts?.find((p) => p.text)
+        ?.text || "no text";
+    res.json({ ok: true, text: txt });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
 
 /* ----------------- Start ----------------- */
 const PORT = process.env.PORT || 3000;
